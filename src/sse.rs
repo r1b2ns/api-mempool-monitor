@@ -13,10 +13,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::mempool::{MempoolClient, MempoolError, TxEvent};
-
-pub struct AppState {
-    pub client: MempoolClient,
-}
+use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct PollParams {
