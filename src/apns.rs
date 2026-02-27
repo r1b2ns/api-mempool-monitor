@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Client as HttpClient;
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum ApnsError {
@@ -15,19 +17,71 @@ pub enum ApnsError {
     Apns { code: u16, reason: String },
 }
 
-/// Claims do JWT de autenticação APNS (token-based auth)
+// ── Live Activity ─────────────────────────────────────────────────────────────
+
+/// Tipo do evento enviado à Live Activity.
+///
+/// | Valor    | Quando usar                                             |
+/// |----------|---------------------------------------------------------|
+/// | `Update` | Atualiza o `ContentState` mantendo a activity ativa     |
+/// | `End`    | Atualiza o `ContentState` e encerra a activity          |
+#[derive(Debug, Clone, Copy)]
+pub enum LiveActivityEvent {
+    Update,
+    End,
+}
+
+impl LiveActivityEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::End    => "end",
+        }
+    }
+}
+
+/// Estado dinâmico da Live Activity — espelha o `ContentState` do Swift.
+///
+/// Serializado como `content-state` no payload APNS.
+#[derive(Debug, Serialize)]
+pub struct LiveActivityContentState {
+    /// Número de confirmações (0 = pendente, ≥1 = confirmada)
+    pub confirmations: u32,
+    /// Status textual: "pending" | "confirmed" | "failed"
+    pub status: String,
+}
+
+// ── JWT cache ─────────────────────────────────────────────────────────────────
+
+/// Token JWT em cache com o instante em que foi emitido (Unix timestamp, segundos).
+struct CachedToken {
+    token:     String,
+    issued_at: u64,
+}
+
+/// Tempo de vida do token reutilizável.
+///
+/// A Apple aceita JWTs com até 60 min de idade; renovamos aos 55 min para
+/// manter margem de segurança e nunca ultrapassar o limite de 2 tokens / 20 min.
+const TOKEN_TTL_SECS: u64 = 55 * 60; // 55 minutos
+
+// ── Claims JWT ────────────────────────────────────────────────────────────────
+
 #[derive(Serialize)]
 struct ApnsClaims {
-    /// Team ID (issuer)
     iss: String,
-    /// Issued-at timestamp (segundos desde Unix epoch)
     iat: u64,
 }
 
+// ── Cliente ───────────────────────────────────────────────────────────────────
+
 /// Cliente APNS implementado diretamente sobre HTTP/2 + JWT.
 ///
-/// Usa `reqwest` (já presente no projeto) para evitar conflitos de versão
-/// com outras dependências que também utilizam `hyper`.
+/// ### Cache de JWT
+/// A Apple limita a **2 tokens novos por janela de 20 minutos** por Team ID.
+/// Gerar um JWT a cada request dispara `TooManyProviderTokenUpdates` (429).
+/// Para evitar isso, o cliente armazena o JWT em memória e o reutiliza por
+/// até 55 minutos, renovando-o automaticamente só quando necessário.
 #[derive(Clone)]
 pub struct ApnsClient {
     http: Arc<HttpClient>,
@@ -39,6 +93,8 @@ pub struct ApnsClient {
     pub production: bool,
     /// Conteúdo PEM da chave privada (.p8)
     pem: Arc<String>,
+    /// JWT em cache — compartilhado entre todos os clones via Arc<Mutex>
+    token_cache: Arc<Mutex<Option<CachedToken>>>,
 }
 
 impl ApnsClient {
@@ -81,7 +137,7 @@ impl ApnsClient {
         let http = HttpClient::builder()
             .user_agent("api-mempool-monitor/0.1")
             .timeout(Duration::from_secs(10))
-            .http2_prior_knowledge()  // garante que apenas HTTP/2 seja usado
+            .http2_prior_knowledge()
             .build()?;
 
         Ok(Some(Self {
@@ -91,30 +147,47 @@ impl ApnsClient {
             bundle_id,
             production,
             pem: Arc::new(pem),
+            token_cache: Arc::new(Mutex::new(None)),
         }))
     }
 
-    /// Gera um JWT assinado com ES256 para autenticar no APNS.
+    // ── JWT com cache ─────────────────────────────────────────────────────────
+
+    /// Retorna o JWT vigente, gerando um novo somente quando o cache expirar.
     ///
-    /// O token é válido por 1 hora. Como o overhead de geração é mínimo
-    /// (microssegundos), geramos um novo token a cada chamada.
-    fn jwt_token(&self) -> Result<String, ApnsError> {
-        let iat = SystemTime::now()
+    /// **Regra Apple:** máx. 2 tokens novos por janela de 20 min por Team ID.
+    /// Reutilizamos o mesmo JWT por `TOKEN_TTL_SECS` (55 min) para nunca
+    /// ultrapassar esse limite mesmo com muitos polls simultâneos.
+    async fn jwt_token(&self) -> Result<String, ApnsError> {
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let claims = ApnsClaims {
-            iss: self.team_id.clone(),
-            iat,
-        };
+        let mut cache = self.token_cache.lock().await;
 
+        // Devolve o token em cache se ainda estiver dentro do TTL
+        if let Some(ref cached) = *cache {
+            if now.saturating_sub(cached.issued_at) < TOKEN_TTL_SECS {
+                return Ok(cached.token.clone());
+            }
+            debug!("JWT APNS expirado — renovando (age={}s)", now - cached.issued_at);
+        } else {
+            debug!("JWT APNS ausente — gerando pela primeira vez");
+        }
+
+        // Gera novo JWT
+        let claims = ApnsClaims { iss: self.team_id.clone(), iat: now };
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(self.key_id.clone());
-
         let key = jsonwebtoken::EncodingKey::from_ec_pem(self.pem.as_bytes())?;
-        Ok(jsonwebtoken::encode(&header, &claims, &key)?)
+        let token = jsonwebtoken::encode(&header, &claims, &key)?;
+
+        *cache = Some(CachedToken { token: token.clone(), issued_at: now });
+        Ok(token)
     }
+
+    // ── Push de alerta convencional ───────────────────────────────────────────
 
     /// Envia uma notificação de alerta via APNS HTTP/2 API.
     ///
@@ -135,39 +208,98 @@ impl ApnsClient {
         };
         let url = format!("{host}/3/device/{device_token}");
 
-        let token = self.jwt_token()?;
+        let token = self.jwt_token().await?;
 
         // Monta o objeto alert
         let mut alert = serde_json::Map::new();
-        if let Some(t) = title {
-            alert.insert("title".into(), t.into());
-        }
-        if let Some(b) = body {
-            alert.insert("body".into(), b.into());
-        }
+        if let Some(t) = title { alert.insert("title".into(), t.into()); }
+        if let Some(b) = body  { alert.insert("body".into(),  b.into()); }
 
         // Monta o objeto aps
         let mut aps = serde_json::json!({ "alert": alert });
-        if let Some(n) = badge {
-            aps["badge"] = serde_json::json!(n);
-        }
-        if let Some(s) = sound {
-            aps["sound"] = serde_json::Value::String(s.into());
-        }
+        if let Some(n) = badge { aps["badge"] = serde_json::json!(n); }
+        if let Some(s) = sound { aps["sound"] = serde_json::Value::String(s.into()); }
 
         // Payload raiz
         let mut payload = serde_json::json!({ "aps": aps });
-        if let Some(data) = custom_data {
-            payload["data"] = data.clone();
-        }
+        if let Some(data) = custom_data { payload["data"] = data.clone(); }
 
+        self.post(&url, &token, &self.bundle_id, "alert", &payload).await
+    }
+
+    // ── Live Activity ─────────────────────────────────────────────────────────
+
+    /// Envia uma atualização de Live Activity via APNS HTTP/2.
+    ///
+    /// Usa o **activity push token** (diferente do device token APNs regular),
+    /// que é obtido pela Live Activity em execução no dispositivo.
+    ///
+    /// ### Payload gerado
+    /// ```json
+    /// {
+    ///   "aps": {
+    ///     "event": "update",
+    ///     "content-state": { "confirmations": 0, "status": "pending" },
+    ///     "timestamp": 1712345678
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// ### Headers APNS obrigatórios para Live Activity
+    /// - `apns-push-type: liveactivity`
+    /// - `apns-topic: <bundle_id>.push-type.liveactivity`
+    pub async fn send_live_activity_update(
+        &self,
+        activity_token: &str,
+        event: LiveActivityEvent,
+        content_state: &LiveActivityContentState,
+    ) -> Result<String, ApnsError> {
+        let host = if self.production {
+            "https://api.push.apple.com"
+        } else {
+            "https://api.sandbox.push.apple.com"
+        };
+        let url = format!("{host}/3/device/{activity_token}");
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let payload = serde_json::json!({
+            "aps": {
+                "event":         event.as_str(),
+                "content-state": content_state,
+                "timestamp":     timestamp
+            }
+        });
+
+        let jwt = self.jwt_token().await?;
+
+        // Live Activities exigem topic no formato <bundle_id>.push-type.liveactivity
+        let topic = format!("{}.push-type.liveactivity", self.bundle_id);
+
+        self.post(&url, &jwt, &topic, "liveactivity", &payload).await
+    }
+
+    // ── Helper HTTP ───────────────────────────────────────────────────────────
+
+    /// Executa o POST para o endpoint APNS e interpreta a resposta.
+    async fn post(
+        &self,
+        url: &str,
+        jwt: &str,
+        topic: &str,
+        push_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<String, ApnsError> {
         let response = self
             .http
-            .post(&url)
-            .header("authorization", format!("bearer {token}"))
-            .header("apns-topic", &self.bundle_id)
-            .header("apns-push-type", "alert")
-            .json(&payload)
+            .post(url)
+            .header("authorization", format!("bearer {jwt}"))
+            .header("apns-topic",    topic)
+            .header("apns-push-type", push_type)
+            .json(payload)
             .send()
             .await?;
 
@@ -183,11 +315,8 @@ impl ApnsClient {
             Ok(apns_id)
         } else {
             let code = status.as_u16();
-            let resp_body: serde_json::Value = response.json().await.unwrap_or_default();
-            let reason = resp_body["reason"]
-                .as_str()
-                .unwrap_or("Unknown")
-                .to_string();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let reason = body["reason"].as_str().unwrap_or("Unknown").to_string();
             Err(ApnsError::Apns { code, reason })
         }
     }

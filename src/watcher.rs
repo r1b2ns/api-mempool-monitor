@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::apns::ApnsClient;
+use crate::apns::{ApnsClient, LiveActivityContentState, LiveActivityEvent};
 use crate::mempool::{MempoolClient, MempoolError};
 use crate::AppState;
 
@@ -26,9 +26,13 @@ pub struct WatchRequest {
     /// ID da transação Bitcoin (hex, 64 chars)
     #[serde(rename = "txId")]
     pub tx_id: String,
-    /// Device token iOS que receberá o push na confirmação
-    #[serde(rename = "deviceToken")]
+    /// Device token APNs — usado para push de alerta convencional (opcional)
+    #[serde(rename = "deviceToken", default)]
     pub device_token: String,
+    /// Activity push token da Live Activity em execução no dispositivo.
+    /// Quando presente, cada ciclo de polling envia um update à Live Activity.
+    #[serde(rename = "activityToken")]
+    pub activity_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -60,8 +64,11 @@ pub async fn watch_tx(
     State(state): State<Arc<AppState>>,
     Json(body): Json<WatchRequest>,
 ) -> (StatusCode, Json<WatchResponse>) {
-    let txid = body.tx_id.trim().to_string();
-    let device_token = body.device_token.trim().to_string();
+    let txid          = body.tx_id.trim().to_string();
+    let device_token  = body.device_token.trim().to_string();
+    let activity_token = body.activity_token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 
     // Validação mínima
     if txid.is_empty() {
@@ -76,10 +83,11 @@ pub async fn watch_tx(
     }
 
     info!(
-        txid = %txid,
-        device_token = %device_token,
+        txid           = %txid,
+        device_token   = %device_token,
+        activity_token = ?activity_token,
         poll_interval_secs = POLL_INTERVAL_SECS,
-        max_attempts = MAX_ATTEMPTS,
+        max_attempts   = MAX_ATTEMPTS,
         "Monitoramento registrado — iniciando task em background"
     );
 
@@ -89,6 +97,7 @@ pub async fn watch_tx(
         state.apns.clone(),
         txid.clone(),
         device_token,
+        activity_token,
     ));
 
     (
@@ -108,22 +117,21 @@ pub async fn watch_tx(
 
 /// Faz polling do status da transação até confirmar ou esgotar as tentativas.
 ///
-/// Logs emitidos em cada ciclo:
-/// - `Consultando status` — início de cada tentativa
-/// - `Pendente na mempool` — tx ainda não confirmada (inclui fee e vsize)
-/// - `Não encontrada` — tx não consta no mempool nem na chain
-/// - `Erro ao consultar API` — falha HTTP temporária
-/// - `CONFIRMADA` — tx incluída em bloco (dispara push APNS)
-/// - `Push APNS enviado` / `Falha ao enviar push` — resultado do push
-/// - `Encerrado por timeout` — limite de tentativas atingido
+/// A cada ciclo:
+/// - Consulta status na mempool.space
+/// - Envia update à Live Activity (se `activity_token` presente) com o estado atual
+/// - Quando confirmada: envia evento `end` à Live Activity + push de alerta ao `device_token`
+/// - Para automaticamente após confirmação ou limite de tentativas
 async fn background_poll(
     client: MempoolClient,
     apns: Option<ApnsClient>,
     txid: String,
     device_token: String,
+    activity_token: Option<String>,
 ) {
     info!(
-        txid = %txid,
+        txid           = %txid,
+        has_live_activity = activity_token.is_some(),
         "━━━ [WATCHER] Iniciando monitoramento ━━━"
     );
 
@@ -149,18 +157,21 @@ async fn background_poll(
         if !status.confirmed {
             match client.fetch_tx_fee(&txid).await {
                 Ok(f) => info!(
-                    txid = %txid,
+                    txid         = %txid,
                     attempt,
-                    fee_sats = f.fee,
+                    fee_sats     = f.fee,
                     vsize_vbytes = f.vsize,
                     "Transação pendente na mempool"
                 ),
-                Err(_) => info!(
-                    txid = %txid,
-                    attempt,
-                    "Transação pendente na mempool (fee indisponível)"
-                ),
+                Err(_) => info!(txid = %txid, attempt, "Transação pendente na mempool (fee indisponível)"),
             }
+
+            // Envia update à Live Activity com estado "pending"
+            let state = LiveActivityContentState {
+                confirmations: 0,
+                status: "pending".to_string(),
+            };
+            send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::Update, &state).await;
             continue;
         }
 
@@ -170,15 +181,22 @@ async fn background_poll(
         let block_time   = status.block_time.unwrap_or(0);
 
         info!(
-            txid         = %txid,
+            txid        = %txid,
             attempt,
             block_height,
-            block_hash   = %block_hash,
+            block_hash  = %block_hash,
             block_time,
             "━━━ [WATCHER] Transação CONFIRMADA ━━━"
         );
 
-        // ── 4. Envia push APNS ───────────────────────────────────────────────
+        // Envia evento "end" à Live Activity com estado "confirmed"
+        let state = LiveActivityContentState {
+            confirmations: 1,
+            status: "confirmed".to_string(),
+        };
+        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
+
+        // Envia push de alerta convencional ao device token
         send_push(&apns, &txid, &device_token, block_height).await;
 
         info!(txid = %txid, attempt, "━━━ [WATCHER] Monitoramento encerrado (confirmado) ━━━");
@@ -186,10 +204,56 @@ async fn background_poll(
     }
 
     warn!(
-        txid = %txid,
+        txid         = %txid,
         max_attempts = MAX_ATTEMPTS,
         "━━━ [WATCHER] Monitoramento encerrado por timeout (limite de tentativas atingido) ━━━"
     );
+}
+
+/// Envia atualização de Live Activity via APNS e loga o resultado.
+///
+/// Não faz nada se `activity_token` for `None` ou se o cliente APNS não estiver configurado.
+async fn send_live_activity(
+    apns: &Option<ApnsClient>,
+    txid: &str,
+    activity_token: &Option<String>,
+    event: LiveActivityEvent,
+    content_state: &LiveActivityContentState,
+) {
+    let Some(token) = activity_token else { return };
+    let Some(apns_client) = apns else {
+        warn!(txid = %txid, "APNS não configurado — Live Activity update não enviado");
+        return;
+    };
+
+    info!(
+        txid   = %txid,
+        event  = %event.as_str(),
+        status = %content_state.status,
+        confirmations = content_state.confirmations,
+        "Enviando Live Activity update..."
+    );
+
+    match apns_client
+        .send_live_activity_update(token, event, content_state)
+        .await
+    {
+        Ok(apns_id) => info!(
+            txid    = %txid,
+            event   = %event.as_str(),
+            apns_id = %apns_id,
+            "Live Activity update enviado com sucesso"
+        ),
+        Err(e) => {
+            let mut detail = e.to_string();
+            let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+            while let Some(cause) = src {
+                detail.push_str(&format!(" → {cause}"));
+                src = cause.source();
+            }
+            error!(txid = %txid, event = %event.as_str(), error = %detail, "Falha ao enviar Live Activity update");
+        }
+    }
 }
 
 /// Envia push APNS e loga o resultado detalhadamente.
