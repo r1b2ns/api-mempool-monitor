@@ -153,29 +153,40 @@ async fn background_poll(
             }
         };
 
-        // ── 2. Ainda pendente ────────────────────────────────────────────────
+        // ── 2. Busca fee e valor da transação (mesmo ciclo, uma única chamada) ─
+        let (value_btc, fee_sats) = match client.fetch_tx_fee(&txid).await {
+            Ok(f) => (
+                Some(f.value_sat as f64 / 100_000_000.0),
+                Some(f.fee),
+            ),
+            Err(_) => (None, None),
+        };
+
+        // ── 3. Ainda pendente ────────────────────────────────────────────────
         if !status.confirmed {
-            match client.fetch_tx_fee(&txid).await {
-                Ok(f) => info!(
+            match fee_sats {
+                Some(fee) => info!(
                     txid         = %txid,
                     attempt,
-                    fee_sats     = f.fee,
-                    vsize_vbytes = f.vsize,
+                    fee_sats     = fee,
+                    value_btc    = ?value_btc,
                     "Transação pendente na mempool"
                 ),
-                Err(_) => info!(txid = %txid, attempt, "Transação pendente na mempool (fee indisponível)"),
+                None => info!(txid = %txid, attempt, "Transação pendente na mempool (fee indisponível)"),
             }
 
-            // Envia update à Live Activity com estado "pending"
             let state = LiveActivityContentState {
                 confirmations: 0,
                 status: "pending".to_string(),
+                tx_id: txid.clone(),
+                value_btc,
+                fee_sats,
             };
             send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::Update, &state).await;
             continue;
         }
 
-        // ── 3. Confirmada! ───────────────────────────────────────────────────
+        // ── 4. Confirmada! ───────────────────────────────────────────────────
         let block_height = status.block_height.unwrap_or(0);
         let block_hash   = status.block_hash.as_deref().unwrap_or("?");
         let block_time   = status.block_time.unwrap_or(0);
@@ -186,6 +197,8 @@ async fn background_poll(
             block_height,
             block_hash  = %block_hash,
             block_time,
+            value_btc   = ?value_btc,
+            fee_sats    = ?fee_sats,
             "━━━ [WATCHER] Transação CONFIRMADA ━━━"
         );
 
@@ -193,11 +206,19 @@ async fn background_poll(
         let state = LiveActivityContentState {
             confirmations: 1,
             status: "confirmed".to_string(),
+            tx_id: txid.clone(),
+            value_btc,
+            fee_sats,
         };
         send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
 
-        // Envia push de alerta convencional ao device token
-        send_push(&apns, &txid, &device_token, block_height).await;
+        // Push convencional só é enviado quando NÃO há Live Activity ativa.
+        // Com Live Activity, a confirmação já é exibida diretamente no widget.
+        if activity_token.is_none() {
+            send_push(&apns, &txid, &device_token, block_height).await;
+        } else {
+            info!(txid = %txid, "Push convencional suprimido — Live Activity ativa");
+        }
 
         info!(txid = %txid, attempt, "━━━ [WATCHER] Monitoramento encerrado (confirmado) ━━━");
         return;

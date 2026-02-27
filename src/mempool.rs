@@ -26,6 +26,8 @@ pub struct TxFee {
     pub fee: u64,
     pub weight: u64,
     pub vsize: u64,
+    /// Soma de todos os outputs em satoshis (valor total transferido)
+    pub value_sat: u64,
 }
 
 
@@ -70,10 +72,17 @@ impl MempoolClient {
 
         let tx: serde_json::Value = resp.error_for_status()?.json().await?;
 
+        // Soma todos os outputs para obter o valor total transferido
+        let value_sat = tx["vout"]
+            .as_array()
+            .map(|outputs| outputs.iter().map(|o| o["value"].as_u64().unwrap_or(0)).sum())
+            .unwrap_or(0);
+
         Ok(TxFee {
             fee: tx["fee"].as_u64().unwrap_or(0),
             weight: tx["weight"].as_u64().unwrap_or(0),
             vsize: tx["vsize"].as_u64().unwrap_or(0),
+            value_sat,
         })
     }
 }
