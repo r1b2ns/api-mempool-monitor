@@ -26,6 +26,14 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // Carrega .env.development ou .env.production conforme APP_ENV (padrão: development)
+    let env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+    let env_file = format!(".env.{env}");
+    match dotenvy::from_filename(&env_file) {
+        Ok(path) => eprintln!("Loaded env from {}", path.display()),
+        Err(e) => eprintln!("Warning: could not load {env_file}: {e}"),
+    }
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "api_mempool=info".into()))
         .with(tracing_subscriber::fmt::layer())

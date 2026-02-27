@@ -16,3 +16,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 thiserror = "1"
 a2 = "0.6"
+dotenvy = "0.15"
