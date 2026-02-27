@@ -1,6 +1,5 @@
 mod apns;
 mod mempool;
-mod push;
 mod sse;
 
 use std::sync::Arc;
@@ -13,14 +12,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::apns::ApnsClient;
 use crate::mempool::MempoolClient;
-use crate::push::send_apns_push;
 use crate::sse::watch_tx;
 
 /// Estado compartilhado entre todos os handlers.
 pub struct AppState {
     /// Cliente HTTP para consultar a API do mempool.space
     pub client: MempoolClient,
-    /// Cliente APNS (disponível apenas quando as variáveis de ambiente estão configuradas)
+    /// Cliente APNS — usado internamente ao confirmar transações
     pub apns: Option<ApnsClient>,
 }
 
@@ -44,13 +42,13 @@ async fn main() {
             tracing::info!(
                 production = client.production,
                 bundle_id = %client.bundle_id,
-                "APNS configurado"
+                "APNS configurado — push será enviado ao confirmar transações"
             );
             Some(client)
         }
         Ok(None) => {
             tracing::warn!(
-                "APNS não configurado — endpoint POST /push/apns retornará 503. \
+                "APNS não configurado — push notifications desabilitados. \
                  Defina APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID e APNS_PRIVATE_KEY."
             );
             None
@@ -67,10 +65,8 @@ async fn main() {
     });
 
     let app = Router::new()
-        // Monitoramento de transação Bitcoin via Server-Sent Events
+        // Monitora transação Bitcoin via SSE e envia push APNS ao confirmar
         .route("/tx/watch", post(watch_tx))
-        // Envio de push notification via APNS
-        .route("/push/apns", post(send_apns_push))
         // Health check
         .route("/health", get(|| async { "ok" }))
         .with_state(state);

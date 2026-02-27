@@ -185,14 +185,30 @@ async fn poll_once(
         // Dispara push APNS ao confirmar, se o cliente estiver configurado
         if let Some(apns_client) = apns {
             if !device_token.is_empty() {
-                let title = "Transação Confirmada";
-                let body = format!("Sua transação foi incluída em um bloco: {}…", &txid[..8]);
+                let title = "Transação Confirmada ✓";
+                let block_info = tx_event
+                    .status
+                    .block_height
+                    .map(|h| format!("bloco #{h}"))
+                    .unwrap_or_else(|| "um bloco".to_string());
+                let short_txid = &txid[..txid.len().min(8)];
+                let body = format!("Tx {short_txid}… incluída no {block_info}");
+
                 match apns_client
                     .send_notification(device_token, Some(title), Some(&body), None, Some("default"), None)
                     .await
                 {
                     Ok(apns_id) => info!(%txid, %apns_id, "Push APNS enviado com sucesso"),
-                    Err(e) => warn!(%txid, error = %e, "Falha ao enviar push APNS"),
+                    Err(e) => {
+                        // Exibe a cadeia completa de causas para facilitar o diagnóstico
+                        let mut detail = e.to_string();
+                        let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                        while let Some(cause) = src {
+                            detail.push_str(&format!(" → {cause}"));
+                            src = cause.source();
+                        }
+                        warn!(%txid, error = %detail, "Falha ao enviar push APNS");
+                    }
                 }
             }
         }
