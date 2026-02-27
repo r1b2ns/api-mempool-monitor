@@ -43,7 +43,7 @@ async fn main() {
         Ok(None) => {
             tracing::warn!(
                 "APNS não configurado — endpoint POST /push/apns retornará 503. \
-                 Defina APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID e APNS_PRIVATE_KEY_PATH."
+                 Defina APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID e APNS_PRIVATE_KEY."
             );
             None
         }
@@ -60,7 +60,7 @@ async fn main() {
 
     let app = Router::new()
         // Monitoramento de transação Bitcoin via Server-Sent Events
-        .route("/tx/:txid/watch", get(watch_tx))
+        .route("/tx/watch", post(watch_tx))
         // Envio de push notification via APNS
         .route("/push/apns", post(send_apns_push))
         // Health check
