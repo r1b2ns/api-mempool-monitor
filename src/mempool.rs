@@ -28,15 +28,6 @@ pub struct TxFee {
     pub vsize: u64,
 }
 
-/// Payload enviado ao cliente via SSE
-#[derive(Debug, Clone, Serialize)]
-pub struct TxEvent {
-    pub txid: String,
-    #[serde(flatten)]
-    pub status: TxStatus,
-    pub fee: Option<u64>,
-    pub vsize: Option<u64>,
-}
 
 #[derive(Clone)]
 pub struct MempoolClient {

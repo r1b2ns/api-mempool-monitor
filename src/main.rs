@@ -1,6 +1,6 @@
 mod apns;
 mod mempool;
-mod sse;
+mod watcher;
 
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::apns::ApnsClient;
 use crate::mempool::MempoolClient;
-use crate::sse::watch_tx;
+use crate::watcher::watch_tx;
 
 /// Estado compartilhado entre todos os handlers.
 pub struct AppState {
@@ -65,7 +65,7 @@ async fn main() {
     });
 
     let app = Router::new()
-        // Monitora transação Bitcoin via SSE e envia push APNS ao confirmar
+        // Registra transação para monitoramento em background; retorna 200 imediatamente
         .route("/tx/watch", post(watch_tx))
         // Health check
         .route("/health", get(|| async { "ok" }))
