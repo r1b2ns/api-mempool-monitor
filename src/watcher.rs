@@ -40,6 +40,16 @@ pub struct WatchResponse {
     ok: bool,
     #[serde(rename = "txId")]
     tx_id: String,
+    /// Número de confirmações no momento do registro (0 = pendente)
+    pub confirmations: u32,
+    /// Estado da transação: "pending" | "confirmed" | "failed"
+    pub status: String,
+    /// Valor total transferido em BTC (None se indisponível)
+    #[serde(rename = "valueBtc", skip_serializing_if = "Option::is_none")]
+    pub value_btc: Option<f64>,
+    /// Taxa paga em satoshis (None se indisponível)
+    #[serde(rename = "feeSats", skip_serializing_if = "Option::is_none")]
+    pub fee_sats: Option<u64>,
     message: String,
 }
 
@@ -77,15 +87,37 @@ pub async fn watch_tx(
             Json(WatchResponse {
                 ok: false,
                 tx_id: txid,
+                confirmations: 0,
+                status: "failed".to_string(),
+                value_btc: None,
+                fee_sats: None,
                 message: "txId não pode ser vazio".to_string(),
             }),
         );
     }
 
+    // ── Fetch inicial: retorna o estado atual da tx na resposta ───────────────
+    let (confirmations, status_str, value_btc, fee_sats) =
+        match state.client.fetch_tx_status(&txid).await {
+            Ok(s) => {
+                let conf   = if s.confirmed { 1 } else { 0 };
+                let status = if s.confirmed { "confirmed" } else { "pending" }.to_string();
+                let (vbtc, fsats) = match state.client.fetch_tx_fee(&txid).await {
+                    Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
+                    Err(_) => (None, None),
+                };
+                (conf, status, vbtc, fsats)
+            }
+            // Tx ainda não propagada — retorna pendente sem fee
+            Err(_) => (0u32, "pending".to_string(), None, None),
+        };
+
     info!(
         txid           = %txid,
         device_token   = %device_token,
         activity_token = ?activity_token,
+        confirmations,
+        status         = %status_str,
         poll_interval_secs = POLL_INTERVAL_SECS,
         max_attempts   = MAX_ATTEMPTS,
         "Monitoramento registrado — iniciando task em background"
@@ -105,6 +137,10 @@ pub async fn watch_tx(
         Json(WatchResponse {
             ok: true,
             tx_id: txid,
+            confirmations,
+            status: status_str,
+            value_btc,
+            fee_sats,
             message: format!(
                 "Monitoramento iniciado. Push APNS será enviado ao confirmar \
                  (polling a cada {POLL_INTERVAL_SECS}s, máx. {MAX_ATTEMPTS} tentativas)."
