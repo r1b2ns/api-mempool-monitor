@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, warn};
 
 const MEMPOOL_API: &str = "https://mempool.space/api";
 
@@ -51,22 +52,53 @@ impl MempoolClient {
     /// Retorna `Err(MempoolError::NotFound)` quando a API responde 404.
     pub async fn fetch_tx_status(&self, txid: &str) -> Result<TxStatus, MempoolError> {
         let url = format!("{MEMPOOL_API}/tx/{txid}/status");
-        let resp = self.http.get(&url).send().await?;
+        debug!(txid = %txid, url = %url, "→ GET tx status");
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let resp = self.http.get(&url).send().await?;
+        let http_status = resp.status();
+
+        if http_status == reqwest::StatusCode::NOT_FOUND {
+            warn!(txid = %txid, url = %url, "← 404 tx status (não encontrada)");
             return Err(MempoolError::NotFound);
         }
 
         let status = resp.error_for_status()?.json::<TxStatus>().await?;
+        debug!(
+            txid       = %txid,
+            http       = %http_status,
+            confirmed  = status.confirmed,
+            block_height = ?status.block_height,
+            "← tx status OK"
+        );
         Ok(status)
+    }
+
+    /// Fetches the current best block height (chain tip).
+    ///
+    /// Calls `GET /api/blocks/tip/height`, which returns a plain-text integer.
+    pub async fn fetch_chain_tip(&self) -> Result<u64, MempoolError> {
+        let url = format!("{MEMPOOL_API}/blocks/tip/height");
+        debug!(url = %url, "→ GET chain tip height");
+
+        let resp = self.http.get(&url).send().await?;
+        let http_status = resp.status();
+        let text = resp.error_for_status()?.text().await?;
+        let height: u64 = text.trim().parse().unwrap_or(0);
+
+        debug!(http = %http_status, height, "← chain tip height OK");
+        Ok(height)
     }
 
     /// Busca fee e tamanho virtual da transação.
     pub async fn fetch_tx_fee(&self, txid: &str) -> Result<TxFee, MempoolError> {
         let url = format!("{MEMPOOL_API}/tx/{txid}");
-        let resp = self.http.get(&url).send().await?;
+        debug!(txid = %txid, url = %url, "→ GET tx details");
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let resp = self.http.get(&url).send().await?;
+        let http_status = resp.status();
+
+        if http_status == reqwest::StatusCode::NOT_FOUND {
+            warn!(txid = %txid, url = %url, "← 404 tx details (não encontrada)");
             return Err(MempoolError::NotFound);
         }
 
@@ -78,11 +110,20 @@ impl MempoolClient {
             .map(|outputs| outputs.iter().map(|o| o["value"].as_u64().unwrap_or(0)).sum())
             .unwrap_or(0);
 
-        Ok(TxFee {
+        let result = TxFee {
             fee: tx["fee"].as_u64().unwrap_or(0),
             weight: tx["weight"].as_u64().unwrap_or(0),
             vsize: tx["vsize"].as_u64().unwrap_or(0),
             value_sat,
-        })
+        };
+        debug!(
+            txid      = %txid,
+            http      = %http_status,
+            fee       = result.fee,
+            vsize     = result.vsize,
+            value_sat = result.value_sat,
+            "← tx details OK"
+        );
+        Ok(result)
     }
 }

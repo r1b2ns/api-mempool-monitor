@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -14,9 +14,10 @@ use crate::mempool::{MempoolClient, MempoolError};
 use crate::AppState;
 
 // ── Intervalo de polling e limite máximo de tentativas ───────────────────────
-const POLL_INTERVAL_SECS: u64 = 10;
-/// ~24 horas: 6 polls/min × 60 min × 24 h = 8 640
-const MAX_ATTEMPTS: u32 = 8_640;
+const POLL_INTERVAL_SECS: u64 = 30;
+/// 4 hours: (4h × 3600s) / 30s = 480 attempts
+// const MAX_ATTEMPTS: u32 = 480;
+const MAX_ATTEMPTS: u32 = 480;
 
 // ── Request / Response ────────────────────────────────────────────────────────
 
@@ -50,7 +51,11 @@ pub struct WatchResponse {
     /// Taxa paga em satoshis (None se indisponível)
     #[serde(rename = "feeSats", skip_serializing_if = "Option::is_none")]
     pub fee_sats: Option<u64>,
-    message: String,
+    /// Block height where the transaction was confirmed (None if still pending)
+    #[serde(rename = "blockHeight", skip_serializing_if = "Option::is_none")]
+    pub block_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -91,13 +96,14 @@ pub async fn watch_tx(
                 status: "failed".to_string(),
                 value_btc: None,
                 fee_sats: None,
-                message: "txId não pode ser vazio".to_string(),
+                block_height: None,
+                message: Some("txId não pode ser vazio".to_string()),
             }),
         );
     }
 
     // ── Fetch inicial: retorna o estado atual da tx na resposta ───────────────
-    let (confirmations, status_str, value_btc, fee_sats) =
+    let (confirmations, status_str, value_btc, fee_sats, initial_block_height) =
         match state.client.fetch_tx_status(&txid).await {
             Ok(s) => {
                 let conf   = if s.confirmed { 1 } else { 0 };
@@ -106,10 +112,10 @@ pub async fn watch_tx(
                     Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
                     Err(_) => (None, None),
                 };
-                (conf, status, vbtc, fsats)
+                (conf, status, vbtc, fsats, s.block_height)
             }
-            // Tx ainda não propagada — retorna pendente sem fee
-            Err(_) => (0u32, "pending".to_string(), None, None),
+            // Tx not yet propagated — return pending without fee
+            Err(_) => (0u32, "pending".to_string(), None, None, None),
         };
 
     info!(
@@ -141,10 +147,110 @@ pub async fn watch_tx(
             status: status_str,
             value_btc,
             fee_sats,
-            message: format!(
+            block_height: initial_block_height,
+            message: Some(format!(
                 "Monitoramento iniciado. Push APNS será enviado ao confirmar \
                  (polling a cada {POLL_INTERVAL_SECS}s, máx. {MAX_ATTEMPTS} tentativas)."
-            ),
+            )),
+        }),
+    )
+}
+
+// ── GET /tx/:txid ─────────────────────────────────────────────────────────────
+
+/// `GET /tx/:txid`
+///
+/// Consulta o estado atual de uma transação na mempool e retorna os mesmos
+/// campos que `POST /tx/watch` inclui na resposta.
+///
+/// ### Resposta 200
+/// ```json
+/// { "ok": true, "txId": "abc…", "confirmations": 1, "status": "confirmed",
+///   "valueBtc": 0.0725, "feeSats": 7119 }
+/// ```
+///
+/// ### Resposta 404
+/// ```json
+/// { "ok": false, "txId": "abc…", "confirmations": 0, "status": "failed" }
+/// ```
+pub async fn get_tx(
+    State(state): State<Arc<AppState>>,
+    Path(txid): Path<String>,
+) -> (StatusCode, Json<WatchResponse>) {
+    let txid = txid.trim().to_string();
+    info!(txid = %txid, "GET /tx/:txid");
+
+    let tx_status = match state.client.fetch_tx_status(&txid).await {
+        Ok(s) => s,
+        Err(MempoolError::NotFound) => {
+            warn!(txid = %txid, "GET /tx/:txid → 404 (transação não encontrada)");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(WatchResponse {
+                    ok: false,
+                    tx_id: txid,
+                    confirmations: 0,
+                    status: "failed".to_string(),
+                    value_btc: None,
+                    fee_sats: None,
+                    block_height: None,
+                    message: None,
+                }),
+            );
+        }
+        Err(e) => {
+            warn!(txid = %txid, error = %e, "GET /tx/:txid → 502 (erro ao consultar mempool API)");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(WatchResponse {
+                    ok: false,
+                    tx_id: txid,
+                    confirmations: 0,
+                    status: "failed".to_string(),
+                    value_btc: None,
+                    fee_sats: None,
+                    block_height: None,
+                    message: Some(e.to_string()),
+                }),
+            );
+        }
+    };
+
+    let (conf, status) = if tx_status.confirmed {
+        // Confirmations = chain_tip - block_height + 1
+        let block_height = tx_status.block_height.unwrap_or(0);
+        let chain_tip    = state.client.fetch_chain_tip().await.unwrap_or(block_height);
+        let confirmations = (chain_tip.saturating_sub(block_height) + 1) as u32;
+        (confirmations, "confirmed".to_string())
+    } else {
+        (0, "pending".to_string())
+    };
+
+    let (value_btc, fee_sats) = match state.client.fetch_tx_fee(&txid).await {
+        Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
+        Err(_) => (None, None),
+    };
+
+    info!(
+        txid      = %txid,
+        status    = %status,
+        confirmations = conf,
+        value_btc = ?value_btc,
+        fee_sats  = ?fee_sats,
+        "GET /tx/:txid → 200"
+    );
+
+    (
+        StatusCode::OK,
+        Json(WatchResponse {
+            ok: true,
+            tx_id: txid,
+            confirmations: conf,
+            status,
+            value_btc,
+            fee_sats,
+            block_height: tx_status.block_height,
+            message: None,
         }),
     )
 }
@@ -248,12 +354,24 @@ async fn background_poll(
         };
         send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
 
-        // Push convencional só é enviado quando NÃO há Live Activity ativa.
-        // Com Live Activity, a confirmação já é exibida diretamente no widget.
+        // Conventional push is only sent when there is no active Live Activity.
+        // With Live Activity, confirmation is already shown directly in the widget.
         if activity_token.is_none() {
-            send_push(&apns, &txid, &device_token, block_height).await;
+            let short_txid = &txid[..txid.len().min(8)];
+            let block_info = if block_height > 0 {
+                format!("block #{block_height}")
+            } else {
+                "a block".to_string()
+            };
+            send_push(
+                &apns,
+                &txid,
+                &device_token,
+                "Transaction Confirmed ✓",
+                &format!("Tx {short_txid}… included in {block_info}"),
+            ).await;
         } else {
-            info!(txid = %txid, "Push convencional suprimido — Live Activity ativa");
+            info!(txid = %txid, "Conventional push suppressed — Live Activity is active");
         }
 
         info!(txid = %txid, attempt, "━━━ [WATCHER] Monitoramento encerrado (confirmado) ━━━");
@@ -263,8 +381,31 @@ async fn background_poll(
     warn!(
         txid         = %txid,
         max_attempts = MAX_ATTEMPTS,
-        "━━━ [WATCHER] Monitoramento encerrado por timeout (limite de tentativas atingido) ━━━"
+        "━━━ [WATCHER] Monitoring timed out — max attempts reached ━━━"
     );
+
+    // Notify the user that monitoring expired without confirmation
+    let short_txid = &txid[..txid.len().min(8)];
+    send_push(
+        &apns,
+        &txid,
+        &device_token,
+        "Transaction monitoring expired",
+        &format!("Tx {short_txid}… was not confirmed within 4 hours."),
+    ).await;
+
+    // Close the Live Activity with "failed" status if one is active
+    if activity_token.is_some() {
+        let state = LiveActivityContentState {
+            confirmations: 0,
+            status: "failed".to_string(),
+            tx_id: txid.clone(),
+            value_btc: None,
+            fee_sats:  None,
+        };
+        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
+    }
+
 }
 
 /// Envia atualização de Live Activity via APNS e loga o resultado.
@@ -313,58 +454,49 @@ async fn send_live_activity(
     }
 }
 
-/// Envia push APNS e loga o resultado detalhadamente.
+/// Sends an APNS alert push and logs the result.
 async fn send_push(
     apns: &Option<ApnsClient>,
     txid: &str,
     device_token: &str,
-    block_height: u64,
+    title: &str,
+    body: &str,
 ) {
     let Some(apns_client) = apns else {
-        warn!(txid = %txid, "APNS não configurado — push não enviado");
+        warn!(txid = %txid, "APNS not configured — push not sent");
         return;
     };
 
     if device_token.is_empty() {
-        warn!(txid = %txid, "device_token vazio — push não enviado");
+        warn!(txid = %txid, "device_token is empty — push not sent");
         return;
     }
-
-    let title      = "Transação Confirmada ✓";
-    let short_txid = &txid[..txid.len().min(8)];
-    let block_info = if block_height > 0 {
-        format!("bloco #{block_height}")
-    } else {
-        "um bloco".to_string()
-    };
-    let body = format!("Tx {short_txid}… incluída no {block_info}");
 
     info!(
         txid         = %txid,
         device_token = %device_token,
         title        = %title,
         body         = %body,
-        "Enviando push APNS..."
+        "Sending APNS push..."
     );
 
     match apns_client
-        .send_notification(device_token, Some(title), Some(&body), None, Some("default"), None)
+        .send_notification(device_token, Some(title), Some(body), None, Some("default"), None)
         .await
     {
         Ok(apns_id) => info!(
-            txid     = %txid,
-            apns_id  = %apns_id,
-            "Push APNS enviado com sucesso"
+            txid    = %txid,
+            apns_id = %apns_id,
+            "APNS push sent successfully"
         ),
         Err(e) => {
-            // Expõe a cadeia completa de causas para facilitar diagnóstico
             let mut detail = e.to_string();
             let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
             while let Some(cause) = src {
                 detail.push_str(&format!(" → {cause}"));
                 src = cause.source();
             }
-            error!(txid = %txid, error = %detail, "Falha ao enviar push APNS");
+            error!(txid = %txid, error = %detail, "Failed to send APNS push");
         }
     }
 }
