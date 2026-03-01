@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -50,7 +50,8 @@ pub struct WatchResponse {
     /// Taxa paga em satoshis (None se indisponível)
     #[serde(rename = "feeSats", skip_serializing_if = "Option::is_none")]
     pub fee_sats: Option<u64>,
-    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -91,7 +92,7 @@ pub async fn watch_tx(
                 status: "failed".to_string(),
                 value_btc: None,
                 fee_sats: None,
-                message: "txId não pode ser vazio".to_string(),
+                message: Some("txId não pode ser vazio".to_string()),
             }),
         );
     }
@@ -141,10 +142,88 @@ pub async fn watch_tx(
             status: status_str,
             value_btc,
             fee_sats,
-            message: format!(
+            message: Some(format!(
                 "Monitoramento iniciado. Push APNS será enviado ao confirmar \
                  (polling a cada {POLL_INTERVAL_SECS}s, máx. {MAX_ATTEMPTS} tentativas)."
-            ),
+            )),
+        }),
+    )
+}
+
+// ── GET /tx/:txid ─────────────────────────────────────────────────────────────
+
+/// `GET /tx/:txid`
+///
+/// Consulta o estado atual de uma transação na mempool e retorna os mesmos
+/// campos que `POST /tx/watch` inclui na resposta.
+///
+/// ### Resposta 200
+/// ```json
+/// { "ok": true, "txId": "abc…", "confirmations": 1, "status": "confirmed",
+///   "valueBtc": 0.0725, "feeSats": 7119 }
+/// ```
+///
+/// ### Resposta 404
+/// ```json
+/// { "ok": false, "txId": "abc…", "confirmations": 0, "status": "failed" }
+/// ```
+pub async fn get_tx(
+    State(state): State<Arc<AppState>>,
+    Path(txid): Path<String>,
+) -> (StatusCode, Json<WatchResponse>) {
+    let txid = txid.trim().to_string();
+
+    let tx_status = match state.client.fetch_tx_status(&txid).await {
+        Ok(s) => s,
+        Err(MempoolError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(WatchResponse {
+                    ok: false,
+                    tx_id: txid,
+                    confirmations: 0,
+                    status: "failed".to_string(),
+                    value_btc: None,
+                    fee_sats: None,
+                    message: None,
+                }),
+            );
+        }
+        Err(e) => {
+            warn!(txid = %txid, error = %e, "Erro ao consultar mempool API");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(WatchResponse {
+                    ok: false,
+                    tx_id: txid,
+                    confirmations: 0,
+                    status: "failed".to_string(),
+                    value_btc: None,
+                    fee_sats: None,
+                    message: Some(e.to_string()),
+                }),
+            );
+        }
+    };
+
+    let conf   = if tx_status.confirmed { 1 } else { 0 };
+    let status = if tx_status.confirmed { "confirmed" } else { "pending" }.to_string();
+
+    let (value_btc, fee_sats) = match state.client.fetch_tx_fee(&txid).await {
+        Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
+        Err(_) => (None, None),
+    };
+
+    (
+        StatusCode::OK,
+        Json(WatchResponse {
+            ok: true,
+            tx_id: txid,
+            confirmations: conf,
+            status,
+            value_btc,
+            fee_sats,
+            message: None,
         }),
     )
 }

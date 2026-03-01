@@ -12,7 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::apns::ApnsClient;
 use crate::mempool::MempoolClient;
-use crate::watcher::watch_tx;
+use crate::watcher::{get_tx, watch_tx};
 
 /// Estado compartilhado entre todos os handlers.
 pub struct AppState {
@@ -65,6 +65,8 @@ async fn main() {
     });
 
     let app = Router::new()
+        // Consulta o estado atual de uma transação
+        .route("/tx/:txid", get(get_tx))
         // Registra transação para monitoramento em background; retorna 200 imediatamente
         .route("/tx/watch", post(watch_tx))
         // Health check
