@@ -172,10 +172,12 @@ pub async fn get_tx(
     Path(txid): Path<String>,
 ) -> (StatusCode, Json<WatchResponse>) {
     let txid = txid.trim().to_string();
+    info!(txid = %txid, "GET /tx/:txid");
 
     let tx_status = match state.client.fetch_tx_status(&txid).await {
         Ok(s) => s,
         Err(MempoolError::NotFound) => {
+            warn!(txid = %txid, "GET /tx/:txid → 404 (transação não encontrada)");
             return (
                 StatusCode::NOT_FOUND,
                 Json(WatchResponse {
@@ -190,7 +192,7 @@ pub async fn get_tx(
             );
         }
         Err(e) => {
-            warn!(txid = %txid, error = %e, "Erro ao consultar mempool API");
+            warn!(txid = %txid, error = %e, "GET /tx/:txid → 502 (erro ao consultar mempool API)");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(WatchResponse {
@@ -213,6 +215,15 @@ pub async fn get_tx(
         Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
         Err(_) => (None, None),
     };
+
+    info!(
+        txid      = %txid,
+        status    = %status,
+        confirmations = conf,
+        value_btc = ?value_btc,
+        fee_sats  = ?fee_sats,
+        "GET /tx/:txid → 200"
+    );
 
     (
         StatusCode::OK,
