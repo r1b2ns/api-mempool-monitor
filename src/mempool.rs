@@ -73,6 +73,22 @@ impl MempoolClient {
         Ok(status)
     }
 
+    /// Fetches the current best block height (chain tip).
+    ///
+    /// Calls `GET /api/blocks/tip/height`, which returns a plain-text integer.
+    pub async fn fetch_chain_tip(&self) -> Result<u64, MempoolError> {
+        let url = format!("{MEMPOOL_API}/blocks/tip/height");
+        debug!(url = %url, "→ GET chain tip height");
+
+        let resp = self.http.get(&url).send().await?;
+        let http_status = resp.status();
+        let text = resp.error_for_status()?.text().await?;
+        let height: u64 = text.trim().parse().unwrap_or(0);
+
+        debug!(http = %http_status, height, "← chain tip height OK");
+        Ok(height)
+    }
+
     /// Busca fee e tamanho virtual da transação.
     pub async fn fetch_tx_fee(&self, txid: &str) -> Result<TxFee, MempoolError> {
         let url = format!("{MEMPOOL_API}/tx/{txid}");
