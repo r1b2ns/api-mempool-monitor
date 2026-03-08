@@ -11,6 +11,8 @@ pub enum MempoolError {
     Http(#[from] reqwest::Error),
     #[error("Transaction not found")]
     NotFound,
+    #[error("Client error from mempool API: HTTP {0}")]
+    ClientError(u16),
 }
 
 /// Resposta do endpoint GET /tx/{txid}/status
@@ -74,6 +76,11 @@ impl MempoolClient {
             return Err(MempoolError::NotFound);
         }
 
+        if http_status.is_client_error() {
+            warn!(txid = %txid, url = %url, status = %http_status, "← 4XX tx status");
+            return Err(MempoolError::ClientError(http_status.as_u16()));
+        }
+
         let status = resp.error_for_status()?.json::<TxStatus>().await?;
         debug!(
             txid       = %txid,
@@ -112,6 +119,11 @@ impl MempoolClient {
         if http_status == reqwest::StatusCode::NOT_FOUND {
             warn!(txid = %txid, url = %url, "← 404 tx details (não encontrada)");
             return Err(MempoolError::NotFound);
+        }
+
+        if http_status.is_client_error() {
+            warn!(txid = %txid, url = %url, status = %http_status, "← 4XX tx details");
+            return Err(MempoolError::ClientError(http_status.as_u16()));
         }
 
         let tx: serde_json::Value = resp.error_for_status()?.json().await?;

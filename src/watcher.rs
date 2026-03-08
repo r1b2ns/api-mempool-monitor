@@ -289,6 +289,10 @@ async fn background_poll(
                 warn!(txid = %txid, attempt, "Transação não encontrada na mempool (aguardando propagação)");
                 continue;
             }
+            Err(MempoolError::ClientError(code)) => {
+                warn!(txid = %txid, attempt, status_code = code, "4XX from mempool API — stopping poll");
+                return;
+            }
             Err(e) => {
                 warn!(txid = %txid, attempt, error = %e, "Erro ao consultar mempool API — tentando novamente");
                 continue;
