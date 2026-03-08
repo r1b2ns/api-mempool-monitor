@@ -6,8 +6,17 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use tracing::{error, info, warn};
+
+// Matches a valid Bitcoin txid: exactly 64 lowercase or uppercase hex characters.
+static TXID_RE: OnceLock<Regex> = OnceLock::new();
+
+fn txid_regex() -> &'static Regex {
+    TXID_RE.get_or_init(|| Regex::new(r"^[0-9a-fA-F]{64}$").expect("invalid txid regex"))
+}
 
 use crate::apns::{ApnsClient, LiveActivityContentState, LiveActivityEvent};
 use crate::mempool::{MempoolClient, MempoolError};
@@ -85,8 +94,8 @@ pub async fn watch_tx(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
 
-    // Validação mínima
-    if txid.is_empty() {
+    // Validate txid format: must be exactly 64 hex characters
+    if !txid_regex().is_match(&txid) {
         return (
             StatusCode::BAD_REQUEST,
             Json(WatchResponse {
@@ -97,7 +106,7 @@ pub async fn watch_tx(
                 value_btc: None,
                 fee_sats: None,
                 block_height: None,
-                message: Some("txId não pode ser vazio".to_string()),
+                message: Some("txId inválido: deve conter exatamente 64 caracteres hexadecimais".to_string()),
             }),
         );
     }
@@ -179,6 +188,23 @@ pub async fn get_tx(
 ) -> (StatusCode, Json<WatchResponse>) {
     let txid = txid.trim().to_string();
     info!(txid = %txid, "GET /tx/:txid");
+
+    // Validate txid format: must be exactly 64 hex characters
+    if !txid_regex().is_match(&txid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WatchResponse {
+                ok: false,
+                tx_id: txid,
+                confirmations: 0,
+                status: "failed".to_string(),
+                value_btc: None,
+                fee_sats: None,
+                block_height: None,
+                message: Some("txId inválido: deve conter exatamente 64 caracteres hexadecimais".to_string()),
+            }),
+        );
+    }
 
     let tx_status = match state.client.fetch_tx_status(&txid).await {
         Ok(s) => s,
