@@ -16,6 +16,7 @@ Cargo.lock
 .env
 .env.*
 !.env.example
+!.env.template
 
 # Claude
 CLAUDE.md
