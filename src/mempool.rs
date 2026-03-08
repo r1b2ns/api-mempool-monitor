@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-const MEMPOOL_API: &str = "https://mempool.space/api";
+const MEMPOOL_API_MAINNET: &str = "https://mempool.space/api";
+const MEMPOOL_API_SIGNET:  &str = "https://mempool.space/signet/api";
 
 #[derive(Debug, Error)]
 pub enum MempoolError {
@@ -35,23 +36,34 @@ pub struct TxFee {
 #[derive(Clone)]
 pub struct MempoolClient {
     http: reqwest::Client,
+    /// Base URL of the mempool.space API (mainnet or signet)
+    base_url: String,
 }
 
 impl MempoolClient {
+    /// Creates a new client. Reads `MEMPOOL_NETWORK` from the environment:
+    /// - `"signet"` → uses the signet API endpoint
+    /// - anything else (or unset) → uses mainnet
     pub fn new() -> Self {
+        let base_url = match std::env::var("MEMPOOL_NETWORK").as_deref() {
+            Ok("signet") => MEMPOOL_API_SIGNET,
+            _            => MEMPOOL_API_MAINNET,
+        }.to_string();
+
         Self {
             http: reqwest::Client::builder()
                 .user_agent("api-mempool-monitor/0.1")
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
+            base_url,
         }
     }
 
     /// Busca o status da transação.
     /// Retorna `Err(MempoolError::NotFound)` quando a API responde 404.
     pub async fn fetch_tx_status(&self, txid: &str) -> Result<TxStatus, MempoolError> {
-        let url = format!("{MEMPOOL_API}/tx/{txid}/status");
+        let url = format!("{}/tx/{txid}/status", self.base_url);
         debug!(txid = %txid, url = %url, "→ GET tx status");
 
         let resp = self.http.get(&url).send().await?;
@@ -77,7 +89,7 @@ impl MempoolClient {
     ///
     /// Calls `GET /api/blocks/tip/height`, which returns a plain-text integer.
     pub async fn fetch_chain_tip(&self) -> Result<u64, MempoolError> {
-        let url = format!("{MEMPOOL_API}/blocks/tip/height");
+        let url = format!("{}/blocks/tip/height", self.base_url);
         debug!(url = %url, "→ GET chain tip height");
 
         let resp = self.http.get(&url).send().await?;
@@ -91,7 +103,7 @@ impl MempoolClient {
 
     /// Busca fee e tamanho virtual da transação.
     pub async fn fetch_tx_fee(&self, txid: &str) -> Result<TxFee, MempoolError> {
-        let url = format!("{MEMPOOL_API}/tx/{txid}");
+        let url = format!("{}/tx/{txid}", self.base_url);
         debug!(txid = %txid, url = %url, "→ GET tx details");
 
         let resp = self.http.get(&url).send().await?;

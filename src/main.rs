@@ -59,6 +59,9 @@ async fn main() {
         }
     };
 
+    let network = std::env::var("MEMPOOL_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+    tracing::info!(network = %network, "Mempool network selected");
+
     let state = Arc::new(AppState {
         client: MempoolClient::new(),
         apns,
