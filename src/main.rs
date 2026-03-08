@@ -68,6 +68,8 @@ async fn main() {
     });
 
     let app = Router::new()
+        // Root — responds to HEAD for uptime checks
+        .route("/", get(|| async { "ok" }))
         // Consulta o estado atual de uma transação
         .route("/tx/:txid", get(get_tx))
         // Registra transação para monitoramento em background; retorna 200 imediatamente
