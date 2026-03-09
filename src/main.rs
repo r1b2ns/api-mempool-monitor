@@ -62,6 +62,21 @@ async fn main() {
     let network = std::env::var("MEMPOOL_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
     tracing::info!(network = %network, "Mempool network selected");
 
+    // Log last 5 chars of APNS_PRIVATE_KEY for verification (safe — never exposes the full key)
+    let apns_key_tail = std::env::var("APNS_PRIVATE_KEY")
+        .ok()
+        .and_then(|k| {
+            let trimmed = k.trim().to_string();
+            let chars: Vec<char> = trimmed.chars().collect();
+            if chars.len() >= 5 {
+                Some(chars[chars.len() - 5..].iter().collect::<String>())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "(not set)".to_string());
+    tracing::info!(apns_key_tail = %apns_key_tail, "APNS_PRIVATE_KEY tail");
+
     let state = Arc::new(AppState {
         client: MempoolClient::new(),
         apns,
