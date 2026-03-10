@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::apns::ApnsClient;
@@ -82,6 +83,16 @@ async fn main() {
         apns,
     });
 
+    // Rate limiting: 30 requests/minute per IP, burst of 10
+    let governor_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(2)   // 1 token replenished every 2s = 30 req/min
+            .burst_size(10)  // allow burst of up to 10 requests
+            .finish()
+            .expect("Failed to build rate limiter config"),
+    );
+    tracing::info!("Rate limiter configured: 30 req/min per IP, burst 10");
+
     let app = Router::new()
         // Root — responds to HEAD for uptime checks
         .route("/", get(|| async { "ok" }))
@@ -91,6 +102,7 @@ async fn main() {
         .route("/tx/watch", post(watch_tx))
         // Health check
         .route("/health", get(|| async { "ok" }))
+        .layer(GovernorLayer { config: governor_config })
         .with_state(state);
 
     let addr = "0.0.0.0:3000";

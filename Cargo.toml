@@ -18,3 +18,5 @@ thiserror = "1"
 jsonwebtoken = "9"
 dotenvy = "0.15"
 regex = { version = "1", default-features = false, features = ["std"] }
+tower_governor = "0.4"
+tower = { version = "0.4", features = ["util"] }
