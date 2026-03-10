@@ -2,18 +2,49 @@ mod apns;
 mod mempool;
 mod watcher;
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
     routing::{get, post},
     Router,
 };
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    governor::GovernorConfigBuilder,
+    key_extractor::KeyExtractor,
+    GovernorLayer,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::apns::ApnsClient;
 use crate::mempool::MempoolClient;
 use crate::watcher::{get_tx, watch_tx};
+
+/// Extracts the real client IP from the X-Real-IP header (set by Nginx).
+/// Falls back to the socket peer address when the header is absent (direct connections).
+#[derive(Clone)]
+struct RealIpKeyExtractor;
+
+impl KeyExtractor for RealIpKeyExtractor {
+    type Key = IpAddr;
+
+    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, tower_governor::GovernorError> {
+        // Prefer X-Real-IP set by Nginx reverse proxy
+        if let Some(ip) = req.headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<IpAddr>().ok())
+        {
+            return Ok(ip);
+        }
+
+        // Fallback: socket peer address via ConnectInfo
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
+            .ok_or(tower_governor::GovernorError::UnableToExtractKey)
+    }
+}
 
 /// Estado compartilhado entre todos os handlers.
 pub struct AppState {
@@ -86,6 +117,7 @@ async fn main() {
     // Rate limiting: 30 requests/minute per IP, burst of 10
     let governor_config = Arc::new(
         GovernorConfigBuilder::default()
+            .key_extractor(RealIpKeyExtractor)
             .per_second(2)   // 1 token replenished every 2s = 30 req/min
             .burst_size(10)  // allow burst of up to 10 requests
             .finish()
@@ -112,7 +144,7 @@ async fn main() {
         .await
         .expect("Failed to bind port 3000");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .expect("Server error");
 }
