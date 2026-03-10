@@ -6,8 +6,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use tower_governor::{
     governor::GovernorConfigBuilder,
@@ -46,12 +50,38 @@ impl KeyExtractor for RealIpKeyExtractor {
     }
 }
 
-/// Estado compartilhado entre todos os handlers.
+/// Shared state across all handlers.
 pub struct AppState {
-    /// Cliente HTTP para consultar a API do mempool.space
+    /// HTTP client for querying the mempool.space API
     pub client: MempoolClient,
-    /// Cliente APNS — usado internamente ao confirmar transações
+    /// APNS client — used internally when confirming transactions
     pub apns: Option<ApnsClient>,
+    /// Expected value of the X-API-Key header
+    pub api_key: String,
+}
+
+/// Validates the X-API-Key header on every request.
+/// Returns 401 Unauthorized when the header is missing or does not match.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if provided == state.api_key {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Unauthorized" })),
+        )
+            .into_response()
+    }
 }
 
 #[tokio::main]
@@ -94,6 +124,11 @@ async fn main() {
     let network = std::env::var("MEMPOOL_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
     tracing::info!(network = %network, "Mempool network selected");
 
+    let api_key = std::env::var("API_KEY")
+        .expect("API_KEY must be set in the environment");
+    let key_tail = &api_key[api_key.len().saturating_sub(4)..];
+    tracing::info!(key_tail = %key_tail, "API Key loaded (****<last4>)");
+
     // Log last 5 chars of APNS_PRIVATE_KEY for verification (safe — never exposes the full key)
     let apns_key_tail = std::env::var("APNS_PRIVATE_KEY")
         .ok()
@@ -112,6 +147,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: MempoolClient::new(),
         apns,
+        api_key,
     });
 
     // Rate limiting: 30 requests/minute per IP, burst of 10
@@ -128,12 +164,13 @@ async fn main() {
     let app = Router::new()
         // Root — responds to HEAD for uptime checks
         .route("/", get(|| async { "ok" }))
-        // Consulta o estado atual de uma transação
+        // Query the current status of a transaction
         .route("/tx/:txid", get(get_tx))
-        // Registra transação para monitoramento em background; retorna 200 imediatamente
+        // Register a transaction for background monitoring; returns 200 immediately
         .route("/tx/watch", post(watch_tx))
         // Health check
         .route("/health", get(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(GovernorLayer { config: governor_config })
         .with_state(state);
 
