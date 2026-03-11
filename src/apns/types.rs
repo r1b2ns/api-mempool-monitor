@@ -21,6 +21,21 @@ impl LiveActivityEvent {
     }
 }
 
+/// Projected confirmation block position of a pending transaction.
+///
+/// Determined by comparing the transaction's effective fee rate (sats/vbyte)
+/// against the minimum fee rates of the mempool's projected blocks.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockPosition {
+    /// Fee rate qualifies for the very next block
+    NextBlock,
+    /// Fee rate qualifies for the second upcoming block
+    SecondBlock,
+    /// Transaction is not projected in the first two blocks
+    Other,
+}
+
 /// Dynamic state of the Live Activity — mirrors the Swift ContentState.
 ///
 /// Serialized as `content-state` in the APNS payload.
@@ -41,4 +56,7 @@ pub struct LiveActivityContentState {
     /// Fee paid in satoshis
     #[serde(rename = "feeSats", skip_serializing_if = "Option::is_none")]
     pub fee_sats: Option<u64>,
+    /// Projected block position — present only while the transaction is pending
+    #[serde(rename = "blockPosition", skip_serializing_if = "Option::is_none")]
+    pub block_position: Option<BlockPosition>,
 }

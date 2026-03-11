@@ -194,6 +194,11 @@ impl ApnsClient {
             }
         });
 
+        // Log the full payload for debugging — pretty-printed so it's readable in journals
+        if let Ok(pretty) = serde_json::to_string_pretty(&payload) {
+            debug!(payload = %pretty, "Live Activity payload");
+        }
+
         let jwt = self.jwt_token().await?;
 
         // Live Activities require the topic in the format <bundle_id>.push-type.liveactivity

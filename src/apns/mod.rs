@@ -5,4 +5,4 @@ mod types;
 
 pub use builder::ApnsBuilder;
 pub use client::ApnsClient;
-pub use types::{LiveActivityContentState, LiveActivityEvent};
+pub use types::{BlockPosition, LiveActivityContentState, LiveActivityEvent};

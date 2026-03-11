@@ -18,29 +18,76 @@ fn txid_regex() -> &'static Regex {
     TXID_RE.get_or_init(|| Regex::new(r"^[0-9a-fA-F]{64}$").expect("invalid txid regex"))
 }
 
-use crate::apns::{ApnsClient, LiveActivityContentState, LiveActivityEvent};
-use crate::mempool::{MempoolClient, MempoolError};
+use crate::apns::{ApnsClient, BlockPosition, LiveActivityContentState, LiveActivityEvent};
+use crate::mempool::{MempoolBlock, MempoolClient, MempoolError};
 use crate::AppState;
 
-// ── Intervalo de polling e limite máximo de tentativas ───────────────────────
+// ── Poll settings ─────────────────────────────────────────────────────────────
+
 const POLL_INTERVAL_SECS: u64 = 30;
 /// 4 hours: (4h × 3600s) / 30s = 480 attempts
-// const MAX_ATTEMPTS: u32 = 480;
 const MAX_ATTEMPTS: u32 = 480;
+
+// ── Block position ────────────────────────────────────────────────────────────
+
+/// Determines the projected block position of a pending transaction.
+///
+/// Compares the transaction's effective fee rate (sats/vbyte) against the minimum
+/// fee rate of each projected mempool block (index 0 = next block, index 1 = second).
+/// `fee_range[0]` from the mempool API is the lowest fee rate that made it into
+/// that block — a transaction qualifies if its fee rate is at or above that value.
+///
+/// Returns `Other` when fee_rate is 0 (unknown vsize) or the block list is empty.
+fn compute_block_position(fee_rate: f64, blocks: &[MempoolBlock]) -> BlockPosition {
+    let min_fee_of = |i: usize| -> Option<f64> {
+        blocks.get(i).and_then(|b| b.fee_range.first()).copied()
+    };
+
+    if fee_rate > 0.0 {
+        if let Some(min) = min_fee_of(0) {
+            if fee_rate >= min {
+                return BlockPosition::NextBlock;
+            }
+        }
+        if let Some(min) = min_fee_of(1) {
+            if fee_rate >= min {
+                return BlockPosition::SecondBlock;
+            }
+        }
+    }
+
+    BlockPosition::Other
+}
+
+/// Fetches projected mempool blocks and returns the block position for a given fee rate.
+/// Falls back to `Other` on network errors so a failed call never breaks the poll cycle.
+async fn resolve_block_position(
+    client: &MempoolClient,
+    txid: &str,
+    fee_rate: f64,
+) -> BlockPosition {
+    match client.fetch_mempool_blocks().await {
+        Ok(blocks) => compute_block_position(fee_rate, &blocks),
+        Err(e) => {
+            warn!(txid = %txid, error = %e, "Failed to fetch mempool blocks — defaulting to Other");
+            BlockPosition::Other
+        }
+    }
+}
 
 // ── Request / Response ────────────────────────────────────────────────────────
 
-/// Corpo do `POST /tx/watch`
+/// Body of `POST /tx/watch`
 #[derive(Debug, Deserialize)]
 pub struct WatchRequest {
-    /// ID da transação Bitcoin (hex, 64 chars)
+    /// Bitcoin transaction ID (hex, 64 chars)
     #[serde(rename = "txId")]
     pub tx_id: String,
-    /// Device token APNs — usado para push de alerta convencional (opcional)
+    /// APNs device token — used for conventional alert push (optional)
     #[serde(rename = "deviceToken", default)]
     pub device_token: String,
-    /// Activity push token da Live Activity em execução no dispositivo.
-    /// Quando presente, cada ciclo de polling envia um update à Live Activity.
+    /// Activity push token of the Live Activity running on the device.
+    /// When present, each poll cycle sends a Live Activity update.
     #[serde(rename = "activityToken")]
     pub activity_token: Option<String>,
 }
@@ -50,46 +97,44 @@ pub struct WatchResponse {
     ok: bool,
     #[serde(rename = "txId")]
     tx_id: String,
-    /// Número de confirmações no momento do registro (0 = pendente)
+    /// Number of confirmations at the time of the response (0 = pending)
     pub confirmations: u32,
-    /// Estado da transação: "pending" | "confirmed" | "failed"
+    /// Transaction status: "pending" | "confirmed" | "failed"
     pub status: String,
-    /// Valor total transferido em BTC (None se indisponível)
+    /// Total amount transferred in BTC (None if unavailable)
     #[serde(rename = "valueBtc", skip_serializing_if = "Option::is_none")]
     pub value_btc: Option<f64>,
-    /// Taxa paga em satoshis (None se indisponível)
+    /// Fee paid in satoshis (None if unavailable)
     #[serde(rename = "feeSats", skip_serializing_if = "Option::is_none")]
     pub fee_sats: Option<u64>,
     /// Block height where the transaction was confirmed (None if still pending)
     #[serde(rename = "blockHeight", skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
+    /// Projected block position — present only while the transaction is pending
+    #[serde(rename = "blockPosition", skip_serializing_if = "Option::is_none")]
+    pub block_position: Option<BlockPosition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+// ── Handler: POST /tx/watch ───────────────────────────────────────────────────
 
 /// `POST /tx/watch`
 ///
-/// Registra a transação para monitoramento. Retorna **200** imediatamente e
-/// mantém o polling rodando em uma `tokio::task` de background até que a
-/// transação seja confirmada (ou se esgotem as tentativas).
+/// Registers a transaction for monitoring. Returns **200** immediately and keeps
+/// polling in a background `tokio::task` until the transaction is confirmed
+/// (or the attempt limit is reached).
 ///
 /// ### Body JSON
 /// ```json
-/// { "txId": "abc123…", "deviceToken": "a1b2…" }
-/// ```
-///
-/// ### Resposta 200
-/// ```json
-/// { "ok": true, "txId": "abc123…", "message": "Monitoramento iniciado…" }
+/// { "txId": "abc123…", "deviceToken": "a1b2…", "activityToken": "c3d4…" }
 /// ```
 pub async fn watch_tx(
     State(state): State<Arc<AppState>>,
     Json(body): Json<WatchRequest>,
 ) -> (StatusCode, Json<WatchResponse>) {
-    let txid          = body.tx_id.trim().to_string();
-    let device_token  = body.device_token.trim().to_string();
+    let txid           = body.tx_id.trim().to_string();
+    let device_token   = body.device_token.trim().to_string();
     let activity_token = body.activity_token
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
@@ -106,39 +151,53 @@ pub async fn watch_tx(
                 value_btc: None,
                 fee_sats: None,
                 block_height: None,
-                message: Some("txId inválido: deve conter exatamente 64 caracteres hexadecimais".to_string()),
+                block_position: None,
+                message: Some("Invalid txId: must be exactly 64 hex characters".to_string()),
             }),
         );
     }
 
-    // ── Fetch inicial: retorna o estado atual da tx na resposta ───────────────
-    let (confirmations, status_str, value_btc, fee_sats, initial_block_height) =
+    // ── Initial fetch: return current tx state in the response ────────────────
+    let (confirmations, status_str, value_btc, fee_sats, initial_block_height, block_position) =
         match state.client.fetch_tx_status(&txid).await {
             Ok(s) => {
-                let conf   = if s.confirmed { 1 } else { 0 };
-                let status = if s.confirmed { "confirmed" } else { "pending" }.to_string();
-                let (vbtc, fsats) = match state.client.fetch_tx_fee(&txid).await {
-                    Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
-                    Err(_) => (None, None),
+                let conf       = if s.confirmed { 1 } else { 0 };
+                let status_str = if s.confirmed { "confirmed" } else { "pending" }.to_string();
+
+                let (vbtc, fsats, fee_rate) = match state.client.fetch_tx_fee(&txid).await {
+                    Ok(f) => {
+                        let rate = if f.vsize > 0 { f.fee as f64 / f.vsize as f64 } else { 0.0 };
+                        (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee), rate)
+                    }
+                    Err(_) => (None, None, 0.0),
                 };
-                (conf, status, vbtc, fsats, s.block_height)
+
+                // Block position is only meaningful for pending transactions
+                let bpos = if !s.confirmed {
+                    Some(resolve_block_position(&state.client, &txid, fee_rate).await)
+                } else {
+                    None
+                };
+
+                (conf, status_str, vbtc, fsats, s.block_height, bpos)
             }
-            // Tx not yet propagated — return pending without fee
-            Err(_) => (0u32, "pending".to_string(), None, None, None),
+            // Tx not yet propagated — return pending without fee or block position
+            Err(_) => (0u32, "pending".to_string(), None, None, None, None),
         };
 
     info!(
-        txid           = %txid,
-        device_token   = %device_token,
-        activity_token = ?activity_token,
+        txid              = %txid,
+        device_token      = %device_token,
+        activity_token    = ?activity_token,
         confirmations,
-        status         = %status_str,
+        status            = %status_str,
+        block_position    = ?block_position,
         poll_interval_secs = POLL_INTERVAL_SECS,
-        max_attempts   = MAX_ATTEMPTS,
-        "Monitoramento registrado — iniciando task em background"
+        max_attempts      = MAX_ATTEMPTS,
+        "Monitoring registered — spawning background task"
     );
 
-    // Spawna background sem bloquear o handler
+    // Spawn background poll without blocking the handler
     tokio::spawn(background_poll(
         state.client.clone(),
         state.apns.clone(),
@@ -157,31 +216,21 @@ pub async fn watch_tx(
             value_btc,
             fee_sats,
             block_height: initial_block_height,
+            block_position,
             message: Some(format!(
-                "Monitoramento iniciado. Push APNS será enviado ao confirmar \
-                 (polling a cada {POLL_INTERVAL_SECS}s, máx. {MAX_ATTEMPTS} tentativas)."
+                "Monitoring started. APNS push will be sent on confirmation \
+                 (polling every {POLL_INTERVAL_SECS}s, max {MAX_ATTEMPTS} attempts)."
             )),
         }),
     )
 }
 
-// ── GET /tx/:txid ─────────────────────────────────────────────────────────────
+// ── Handler: GET /tx/:txid ────────────────────────────────────────────────────
 
 /// `GET /tx/:txid`
 ///
-/// Consulta o estado atual de uma transação na mempool e retorna os mesmos
-/// campos que `POST /tx/watch` inclui na resposta.
-///
-/// ### Resposta 200
-/// ```json
-/// { "ok": true, "txId": "abc…", "confirmations": 1, "status": "confirmed",
-///   "valueBtc": 0.0725, "feeSats": 7119 }
-/// ```
-///
-/// ### Resposta 404
-/// ```json
-/// { "ok": false, "txId": "abc…", "confirmations": 0, "status": "failed" }
-/// ```
+/// Queries the current state of a transaction in the mempool and returns the
+/// same fields as `POST /tx/watch`.
 pub async fn get_tx(
     State(state): State<Arc<AppState>>,
     Path(txid): Path<String>,
@@ -201,7 +250,8 @@ pub async fn get_tx(
                 value_btc: None,
                 fee_sats: None,
                 block_height: None,
-                message: Some("txId inválido: deve conter exatamente 64 caracteres hexadecimais".to_string()),
+                block_position: None,
+                message: Some("Invalid txId: must be exactly 64 hex characters".to_string()),
             }),
         );
     }
@@ -209,7 +259,7 @@ pub async fn get_tx(
     let tx_status = match state.client.fetch_tx_status(&txid).await {
         Ok(s) => s,
         Err(MempoolError::NotFound) => {
-            warn!(txid = %txid, "GET /tx/:txid → 404 (transação não encontrada)");
+            warn!(txid = %txid, "GET /tx/:txid → 404 (transaction not found)");
             return (
                 StatusCode::NOT_FOUND,
                 Json(WatchResponse {
@@ -220,12 +270,13 @@ pub async fn get_tx(
                     value_btc: None,
                     fee_sats: None,
                     block_height: None,
+                    block_position: None,
                     message: None,
                 }),
             );
         }
         Err(e) => {
-            warn!(txid = %txid, error = %e, "GET /tx/:txid → 502 (erro ao consultar mempool API)");
+            warn!(txid = %txid, error = %e, "GET /tx/:txid → 502 (mempool API error)");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(WatchResponse {
@@ -236,6 +287,7 @@ pub async fn get_tx(
                     value_btc: None,
                     fee_sats: None,
                     block_height: None,
+                    block_position: None,
                     message: Some(e.to_string()),
                 }),
             );
@@ -244,25 +296,37 @@ pub async fn get_tx(
 
     let (conf, status) = if tx_status.confirmed {
         // Confirmations = chain_tip - block_height + 1
-        let block_height = tx_status.block_height.unwrap_or(0);
-        let chain_tip    = state.client.fetch_chain_tip().await.unwrap_or(block_height);
+        let block_height  = tx_status.block_height.unwrap_or(0);
+        let chain_tip     = state.client.fetch_chain_tip().await.unwrap_or(block_height);
         let confirmations = (chain_tip.saturating_sub(block_height) + 1) as u32;
         (confirmations, "confirmed".to_string())
     } else {
         (0, "pending".to_string())
     };
 
-    let (value_btc, fee_sats) = match state.client.fetch_tx_fee(&txid).await {
-        Ok(f) => (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee)),
-        Err(_) => (None, None),
+    // Fetch fee info; keep the full TxFee so we can compute fee_rate for block position
+    let tx_fee    = state.client.fetch_tx_fee(&txid).await.ok();
+    let value_btc = tx_fee.as_ref().map(|f| f.value_sat as f64 / 100_000_000.0);
+    let fee_sats  = tx_fee.as_ref().map(|f| f.fee);
+    let fee_rate  = tx_fee.as_ref()
+        .filter(|f| f.vsize > 0)
+        .map(|f| f.fee as f64 / f.vsize as f64)
+        .unwrap_or(0.0);
+
+    // Block position is only meaningful while the transaction is pending
+    let block_position = if !tx_status.confirmed {
+        Some(resolve_block_position(&state.client, &txid, fee_rate).await)
+    } else {
+        None
     };
 
     info!(
-        txid      = %txid,
-        status    = %status,
-        confirmations = conf,
-        value_btc = ?value_btc,
-        fee_sats  = ?fee_sats,
+        txid           = %txid,
+        status         = %status,
+        confirmations  = conf,
+        value_btc      = ?value_btc,
+        fee_sats       = ?fee_sats,
+        block_position = ?block_position,
         "GET /tx/:txid → 200"
     );
 
@@ -276,6 +340,7 @@ pub async fn get_tx(
             value_btc,
             fee_sats,
             block_height: tx_status.block_height,
+            block_position,
             message: None,
         }),
     )
@@ -283,13 +348,13 @@ pub async fn get_tx(
 
 // ── Background task ───────────────────────────────────────────────────────────
 
-/// Faz polling do status da transação até confirmar ou esgotar as tentativas.
+/// Polls the transaction status until it confirms or the attempt limit is reached.
 ///
-/// A cada ciclo:
-/// - Consulta status na mempool.space
-/// - Envia update à Live Activity (se `activity_token` presente) com o estado atual
-/// - Quando confirmada: envia evento `end` à Live Activity + push de alerta ao `device_token`
-/// - Para automaticamente após confirmação ou limite de tentativas
+/// On each cycle:
+/// - Fetches status and fee info from the mempool API
+/// - Fetches projected mempool blocks to compute `block_position`
+/// - Sends a Live Activity update (if `activity_token` is set) with the current state
+/// - On confirmation: sends Live Activity `end` event + optional alert push
 async fn background_poll(
     client: MempoolClient,
     apns: Option<ApnsClient>,
@@ -298,21 +363,21 @@ async fn background_poll(
     activity_token: Option<String>,
 ) {
     info!(
-        txid           = %txid,
+        txid              = %txid,
         has_live_activity = activity_token.is_some(),
-        "━━━ [WATCHER] Iniciando monitoramento ━━━"
+        "━━━ [WATCHER] Starting monitoring ━━━"
     );
 
     for attempt in 1..=MAX_ATTEMPTS {
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
 
-        info!(txid = %txid, attempt, "Consultando status da transação...");
+        info!(txid = %txid, attempt, "Querying transaction status...");
 
-        // ── 1. Busca status ──────────────────────────────────────────────────
+        // ── 1. Fetch status ──────────────────────────────────────────────────
         let status = match client.fetch_tx_status(&txid).await {
             Ok(s) => s,
             Err(MempoolError::NotFound) => {
-                warn!(txid = %txid, attempt, "Transação não encontrada na mempool (aguardando propagação)");
+                warn!(txid = %txid, attempt, "Transaction not found in mempool (waiting for propagation)");
                 continue;
             }
             Err(MempoolError::ClientError(code)) => {
@@ -320,45 +385,50 @@ async fn background_poll(
                 return;
             }
             Err(e) => {
-                warn!(txid = %txid, attempt, error = %e, "Erro ao consultar mempool API — tentando novamente");
+                warn!(txid = %txid, attempt, error = %e, "Mempool API error — retrying");
                 continue;
             }
         };
 
-        // ── 2. Busca fee e valor da transação (mesmo ciclo, uma única chamada) ─
-        let (value_btc, fee_sats) = match client.fetch_tx_fee(&txid).await {
-            Ok(f) => (
-                Some(f.value_sat as f64 / 100_000_000.0),
-                Some(f.fee),
-            ),
-            Err(_) => (None, None),
+        // ── 2. Fetch fee and value (single call per cycle) ───────────────────
+        let (value_btc, fee_sats, fee_rate) = match client.fetch_tx_fee(&txid).await {
+            Ok(f) => {
+                let rate = if f.vsize > 0 { f.fee as f64 / f.vsize as f64 } else { 0.0 };
+                (Some(f.value_sat as f64 / 100_000_000.0), Some(f.fee), rate)
+            }
+            Err(_) => (None, None, 0.0),
         };
 
-        // ── 3. Ainda pendente ────────────────────────────────────────────────
+        // ── 3. Still pending ─────────────────────────────────────────────────
         if !status.confirmed {
+            let block_position = resolve_block_position(&client, &txid, fee_rate).await;
+
             match fee_sats {
                 Some(fee) => info!(
-                    txid         = %txid,
+                    txid           = %txid,
                     attempt,
-                    fee_sats     = fee,
-                    value_btc    = ?value_btc,
-                    "Transação pendente na mempool"
+                    fee_sats       = fee,
+                    fee_rate       = format!("{fee_rate:.2}"),
+                    block_position = ?block_position,
+                    value_btc      = ?value_btc,
+                    "Transaction pending in mempool"
                 ),
-                None => info!(txid = %txid, attempt, "Transação pendente na mempool (fee indisponível)"),
+                None => info!(txid = %txid, attempt, "Transaction pending (fee unavailable)"),
             }
 
-            let state = LiveActivityContentState {
+            let content_state = LiveActivityContentState {
                 confirmations: 0,
                 status: "pending".to_string(),
                 tx_id: txid.clone(),
                 value_btc,
                 fee_sats,
+                block_position: Some(block_position),
             };
-            send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::Update, &state).await;
+            send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::Update, &content_state).await;
             continue;
         }
 
-        // ── 4. Confirmada! ───────────────────────────────────────────────────
+        // ── 4. Confirmed! ────────────────────────────────────────────────────
         let block_height = status.block_height.unwrap_or(0);
         let block_hash   = status.block_hash.as_deref().unwrap_or("?");
         let block_time   = status.block_time.unwrap_or(0);
@@ -371,21 +441,22 @@ async fn background_poll(
             block_time,
             value_btc   = ?value_btc,
             fee_sats    = ?fee_sats,
-            "━━━ [WATCHER] Transação CONFIRMADA ━━━"
+            "━━━ [WATCHER] Transaction CONFIRMED ━━━"
         );
 
-        // Envia evento "end" à Live Activity com estado "confirmed"
-        let state = LiveActivityContentState {
+        // Send "end" event to Live Activity with "confirmed" state
+        let content_state = LiveActivityContentState {
             confirmations: 1,
             status: "confirmed".to_string(),
             tx_id: txid.clone(),
             value_btc,
             fee_sats,
+            block_position: None, // not relevant after confirmation
         };
-        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
+        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &content_state).await;
 
-        // Conventional push is only sent when there is no active Live Activity.
-        // With Live Activity, confirmation is already shown directly in the widget.
+        // Conventional push is suppressed when a Live Activity is active —
+        // confirmation is already displayed directly in the widget.
         if activity_token.is_none() {
             let short_txid = &txid[..txid.len().min(8)];
             let block_info = if block_height > 0 {
@@ -404,7 +475,7 @@ async fn background_poll(
             info!(txid = %txid, "Conventional push suppressed — Live Activity is active");
         }
 
-        info!(txid = %txid, attempt, "━━━ [WATCHER] Monitoramento encerrado (confirmado) ━━━");
+        info!(txid = %txid, attempt, "━━━ [WATCHER] Monitoring ended (confirmed) ━━━");
         return;
     }
 
@@ -426,21 +497,23 @@ async fn background_poll(
 
     // Close the Live Activity with "failed" status if one is active
     if activity_token.is_some() {
-        let state = LiveActivityContentState {
+        let content_state = LiveActivityContentState {
             confirmations: 0,
             status: "failed".to_string(),
             tx_id: txid.clone(),
             value_btc: None,
-            fee_sats:  None,
+            fee_sats: None,
+            block_position: None,
         };
-        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &state).await;
+        send_live_activity(&apns, &txid, &activity_token, LiveActivityEvent::End, &content_state).await;
     }
-
 }
 
-/// Envia atualização de Live Activity via APNS e loga o resultado.
+// ── APNS helpers ──────────────────────────────────────────────────────────────
+
+/// Sends a Live Activity update via APNS and logs the result.
 ///
-/// Não faz nada se `activity_token` for `None` ou se o cliente APNS não estiver configurado.
+/// No-ops when `activity_token` is `None` or when the APNS client is not configured.
 async fn send_live_activity(
     apns: &Option<ApnsClient>,
     txid: &str,
@@ -450,27 +523,25 @@ async fn send_live_activity(
 ) {
     let Some(token) = activity_token else { return };
     let Some(apns_client) = apns else {
-        warn!(txid = %txid, "APNS não configurado — Live Activity update não enviado");
+        warn!(txid = %txid, "APNS not configured — Live Activity update skipped");
         return;
     };
 
     info!(
-        txid   = %txid,
-        event  = %event.as_str(),
-        status = %content_state.status,
+        txid          = %txid,
+        event         = %event.as_str(),
+        status        = %content_state.status,
         confirmations = content_state.confirmations,
-        "Enviando Live Activity update..."
+        block_position = ?content_state.block_position,
+        "Sending Live Activity update..."
     );
 
-    match apns_client
-        .send_live_activity_update(token, event, content_state)
-        .await
-    {
+    match apns_client.send_live_activity_update(token, event, content_state).await {
         Ok(apns_id) => info!(
             txid    = %txid,
             event   = %event.as_str(),
             apns_id = %apns_id,
-            "Live Activity update enviado com sucesso"
+            "Live Activity update sent successfully"
         ),
         Err(e) => {
             let mut detail = e.to_string();
@@ -479,7 +550,7 @@ async fn send_live_activity(
                 detail.push_str(&format!(" → {cause}"));
                 src = cause.source();
             }
-            error!(txid = %txid, event = %event.as_str(), error = %detail, "Falha ao enviar Live Activity update");
+            error!(txid = %txid, event = %event.as_str(), error = %detail, "Failed to send Live Activity update");
         }
     }
 }
