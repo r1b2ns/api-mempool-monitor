@@ -18,11 +18,14 @@ use tower_governor::{
     key_extractor::KeyExtractor,
     GovernorLayer,
 };
+use governor::middleware::NoOpMiddleware;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::apns::ApnsClient;
+use crate::apns::{ApnsBuilder, ApnsClient};
 use crate::mempool::MempoolClient;
 use crate::watcher::{get_tx, watch_tx};
+
+// ── Rate limiter ──────────────────────────────────────────────────────────────
 
 /// Extracts the real client IP from the X-Real-IP header (set by Nginx).
 /// Falls back to the socket peer address when the header is absent (direct connections).
@@ -33,7 +36,7 @@ impl KeyExtractor for RealIpKeyExtractor {
     type Key = IpAddr;
 
     fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, tower_governor::GovernorError> {
-        // Prefer X-Real-IP set by Nginx reverse proxy
+        // Prefer X-Real-IP set by the Nginx reverse proxy
         if let Some(ip) = req.headers()
             .get("x-real-ip")
             .and_then(|v| v.to_str().ok())
@@ -42,13 +45,29 @@ impl KeyExtractor for RealIpKeyExtractor {
             return Ok(ip);
         }
 
-        // Fallback: socket peer address via ConnectInfo
+        // Fallback: socket peer address via ConnectInfo (used for direct connections)
         req.extensions()
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map(|ci| ci.0.ip())
             .ok_or(tower_governor::GovernorError::UnableToExtractKey)
     }
 }
+
+/// Builds the rate limiter layer: 30 req/min per IP with a burst of 10.
+fn build_rate_limiter() -> GovernorLayer<RealIpKeyExtractor, NoOpMiddleware> {
+    let config = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(RealIpKeyExtractor)
+            .per_second(2)   // 1 token replenished every 2s = 30 req/min
+            .burst_size(10)  // allow an initial burst of up to 10 requests
+            .finish()
+            .expect("Failed to build rate limiter config"),
+    );
+    tracing::info!("Rate limiter configured: 30 req/min per IP, burst 10");
+    GovernorLayer { config }
+}
+
+// ── App state ─────────────────────────────────────────────────────────────────
 
 /// Shared state across all handlers.
 pub struct AppState {
@@ -59,6 +78,8 @@ pub struct AppState {
     /// Expected value of the X-API-Key header
     pub api_key: String,
 }
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
 
 /// Validates the X-API-Key header on every request.
 /// Returns 401 Unauthorized when the header is missing or does not match.
@@ -84,39 +105,57 @@ async fn auth_middleware(
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Carrega .env.development ou .env.production conforme APP_ENV (padrão: development)
-    let env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+// ── Environment setup ─────────────────────────────────────────────────────────
+
+/// Loads the .env file for the current APP_ENV and initializes the tracing subscriber.
+///
+/// The active environment is resolved in priority order:
+///   1. `APP_ENV` environment variable (explicit override)
+///   2. Cargo build profile: debug build → "development", release build → "production"
+///
+/// This ensures `cargo run` uses dev config and `cargo build --release` uses prod config
+/// without requiring APP_ENV to be set manually. The systemd service files may still
+/// set APP_ENV explicitly to override this behaviour.
+fn setup_env() {
+    // cfg!(debug_assertions) is true for debug builds and false for release builds
+    let default_env = if cfg!(debug_assertions) { "development" } else { "production" };
+    let env = std::env::var("APP_ENV").unwrap_or_else(|_| default_env.to_string());
     let env_file = format!(".env.{env}");
     match dotenvy::from_filename(&env_file) {
         Ok(path) => eprintln!("Loaded env from {}", path.display()),
-        Err(e) => eprintln!("Warning: could not load {env_file}: {e}"),
+        Err(e)   => eprintln!("Warning: could not load {env_file}: {e}"),
     }
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "api_mempool=info".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
 
-    let apns = match ApnsClient::from_env() {
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    setup_env();
+
+    let apns = match ApnsBuilder::build() {
         Ok(Some(client)) => {
             tracing::info!(
                 production = client.production,
-                bundle_id = %client.bundle_id,
-                "APNS configurado — push será enviado ao confirmar transações"
+                bundle_id  = %client.bundle_id,
+                "APNS configured — push will be sent on transaction confirmation"
             );
             Some(client)
         }
         Ok(None) => {
             tracing::warn!(
-                "APNS não configurado — push notifications desabilitados. \
-                 Defina APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID e APNS_PRIVATE_KEY."
+                "APNS not configured — push notifications disabled. \
+                 Set APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, and APNS_PRIVATE_KEY."
             );
             None
         }
         Err(e) => {
-            tracing::error!(error = %e, "Falha ao inicializar cliente APNS");
+            tracing::error!(error = %e, "Failed to initialize APNS client");
             None
         }
     };
@@ -124,42 +163,15 @@ async fn main() {
     let network = std::env::var("MEMPOOL_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
     tracing::info!(network = %network, "Mempool network selected");
 
-    let api_key = std::env::var("API_KEY")
-        .expect("API_KEY must be set in the environment");
+    let api_key  = std::env::var("API_KEY").expect("API_KEY must be set in the environment");
     let key_tail = &api_key[api_key.len().saturating_sub(4)..];
     tracing::info!(key_tail = %key_tail, "API Key loaded (****<last4>)");
-
-    // Log last 5 chars of APNS_PRIVATE_KEY for verification (safe — never exposes the full key)
-    let apns_key_tail = std::env::var("APNS_PRIVATE_KEY")
-        .ok()
-        .and_then(|k| {
-            let trimmed = k.trim().to_string();
-            let chars: Vec<char> = trimmed.chars().collect();
-            if chars.len() >= 5 {
-                Some(chars[chars.len() - 5..].iter().collect::<String>())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "(not set)".to_string());
-    tracing::info!(apns_key_tail = %apns_key_tail, "APNS_PRIVATE_KEY tail");
 
     let state = Arc::new(AppState {
         client: MempoolClient::new(),
         apns,
         api_key,
     });
-
-    // Rate limiting: 30 requests/minute per IP, burst of 10
-    let governor_config = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(RealIpKeyExtractor)
-            .per_second(2)   // 1 token replenished every 2s = 30 req/min
-            .burst_size(10)  // allow burst of up to 10 requests
-            .finish()
-            .expect("Failed to build rate limiter config"),
-    );
-    tracing::info!("Rate limiter configured: 30 req/min per IP, burst 10");
 
     // Public routes — no API key required (used by uptime monitors)
     let public = Router::new()
@@ -175,7 +187,7 @@ async fn main() {
     let app = Router::new()
         .merge(public)
         .merge(protected)
-        .layer(GovernorLayer { config: governor_config })
+        .layer(build_rate_limiter())
         .with_state(state);
 
     let addr = "0.0.0.0:3000";

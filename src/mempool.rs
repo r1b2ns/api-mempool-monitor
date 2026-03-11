@@ -24,14 +24,35 @@ pub struct TxStatus {
     pub block_time: Option<u64>,
 }
 
-/// Subset de campos do endpoint GET /tx/{txid}
+/// Subset of fields from GET /tx/{txid}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TxFee {
     pub fee: u64,
     pub weight: u64,
     pub vsize: u64,
-    /// Soma de todos os outputs em satoshis (valor total transferido)
+    /// Sum of all outputs in satoshis (total transferred value)
     pub value_sat: u64,
+}
+
+/// A single projected block from GET /api/v1/fees/mempool-blocks.
+///
+/// The mempool.space API sorts all pending transactions by fee rate (desc) and
+/// simulates filling blocks of up to 4 million weight units. Index 0 = next block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolBlock {
+    /// Virtual size consumed by all transactions in this projected block
+    #[serde(rename = "blockVSize")]
+    pub block_vsize: f64,
+    /// Number of transactions in this projected block
+    #[serde(rename = "nTx")]
+    pub n_tx: u32,
+    /// Median fee rate of transactions in this block (sats/vbyte)
+    #[serde(rename = "medianFee")]
+    pub median_fee: f64,
+    /// Histogram of fee rates [min, …, max] (sats/vbyte).
+    /// `fee_range[0]` is the minimum fee rate required to be included in this block.
+    #[serde(rename = "feeRange")]
+    pub fee_range: Vec<f64>,
 }
 
 
@@ -108,7 +129,24 @@ impl MempoolClient {
         Ok(height)
     }
 
-    /// Busca fee e tamanho virtual da transação.
+    /// Fetches the projected next mempool blocks.
+    ///
+    /// Calls `GET /api/v1/fees/mempool-blocks`, which returns an array of projected
+    /// blocks ordered by priority (index 0 = next block, index 1 = second block, …).
+    /// Each entry includes the fee-rate range required to be included in that block.
+    pub async fn fetch_mempool_blocks(&self) -> Result<Vec<MempoolBlock>, MempoolError> {
+        let url = format!("{}/v1/fees/mempool-blocks", self.base_url);
+        debug!(url = %url, "→ GET mempool blocks");
+
+        let resp   = self.http.get(&url).send().await?;
+        let status = resp.status();
+        let blocks = resp.error_for_status()?.json::<Vec<MempoolBlock>>().await?;
+
+        debug!(http = %status, count = blocks.len(), "← mempool blocks OK");
+        Ok(blocks)
+    }
+
+    /// Fetches fee and virtual size of a transaction.
     pub async fn fetch_tx_fee(&self, txid: &str) -> Result<TxFee, MempoolError> {
         let url = format!("{}/tx/{txid}", self.base_url);
         debug!(txid = %txid, url = %url, "→ GET tx details");
