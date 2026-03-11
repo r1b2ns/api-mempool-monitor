@@ -109,11 +109,17 @@ async fn auth_middleware(
 
 /// Loads the .env file for the current APP_ENV and initializes the tracing subscriber.
 ///
-/// The file name is derived from the APP_ENV variable (default: "development"),
-/// e.g. `.env.development` or `.env.production`. Missing files are warned but
-/// do not cause a panic — environment variables may be provided by the OS.
+/// The active environment is resolved in priority order:
+///   1. `APP_ENV` environment variable (explicit override)
+///   2. Cargo build profile: debug build → "development", release build → "production"
+///
+/// This ensures `cargo run` uses dev config and `cargo build --release` uses prod config
+/// without requiring APP_ENV to be set manually. The systemd service files may still
+/// set APP_ENV explicitly to override this behaviour.
 fn setup_env() {
-    let env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+    // cfg!(debug_assertions) is true for debug builds and false for release builds
+    let default_env = if cfg!(debug_assertions) { "development" } else { "production" };
+    let env = std::env::var("APP_ENV").unwrap_or_else(|_| default_env.to_string());
     let env_file = format!(".env.{env}");
     match dotenvy::from_filename(&env_file) {
         Ok(path) => eprintln!("Loaded env from {}", path.display()),
