@@ -161,16 +161,20 @@ async fn main() {
     );
     tracing::info!("Rate limiter configured: 30 req/min per IP, burst 10");
 
-    let app = Router::new()
-        // Root — responds to HEAD for uptime checks
-        .route("/", get(|| async { "ok" }))
-        // Query the current status of a transaction
+    // Public routes — no API key required (used by uptime monitors)
+    let public = Router::new()
+        .route("/", get(|| async { "ok" }));
+
+    // Protected routes — require a valid X-API-Key header
+    let protected = Router::new()
         .route("/tx/:txid", get(get_tx))
-        // Register a transaction for background monitoring; returns 200 immediately
         .route("/tx/watch", post(watch_tx))
-        // Health check
         .route("/health", get(|| async { "ok" }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    let app = Router::new()
+        .merge(public)
+        .merge(protected)
         .layer(GovernorLayer { config: governor_config })
         .with_state(state);
 
